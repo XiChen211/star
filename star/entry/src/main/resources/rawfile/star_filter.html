@@ -112,6 +112,72 @@
     }
 </script>
 
+    <script id="vs-pack" type="x-shader/x-vertex">
+    // [中文注释] 通用打包顶点着色器
+    // 这是一个直通 Shader，不做任何顶点变换，仅传递纹理坐标。
+    attribute vec2 a_position;
+    attribute vec2 a_texCoord;
+    varying vec2 v_texCoord;
+    void main() {
+        gl_Position = vec4(a_position, 0.0, 1.0);
+        v_texCoord = a_texCoord;
+    }
+</script>
+
+    <script id="fs-pack-luma" type="x-shader/x-fragment">
+    precision mediump float;
+    uniform sampler2D u_image;
+    uniform float u_width; 
+    uniform float u_height;
+    varying vec2 v_texCoord;
+
+    // [中文注释] 亮度打包 Shader
+    // 作用：将水平方向上连续的 4 个像素的亮度值 (Luma)，打包进一个 RGBA 像素的 4 个通道中。
+    // 结果：输出图像的宽度是原始宽度的 1/4，实现了无损的亮度数据传输（相比于读取单通道纹理，利用了 RGBA 全部带宽）。
+    void main() {
+        // 计算单个像素在纹理坐标中的跨度
+        float onePixel = 1.0 / u_width;
+        
+        // 亮度转换权重 (Standard BT.601)
+        const vec3 W = vec3(0.299, 0.587, 0.114);
+        
+        // 采样中心调整
+        // 我们当前渲染的一个片元 (Fragment) 对应原图中的 4 个水平像素。
+        // 为了精确采样这 4 个像素，我们需要根据中心点进行偏移。
+        // 偏移量分别为：-1.5, -0.5, +0.5, +1.5 个像素单位。
+        
+        float dx = onePixel;
+        vec2 uv_center = v_texCoord; 
+        
+        // 分别采样 4 个像素
+        vec4 p0 = texture2D(u_image, uv_center + vec2(-1.5 * dx, 0.0));
+        vec4 p1 = texture2D(u_image, uv_center + vec2(-0.5 * dx, 0.0));
+        vec4 p2 = texture2D(u_image, uv_center + vec2(0.5 * dx, 0.0));
+        vec4 p3 = texture2D(u_image, uv_center + vec2(1.5 * dx, 0.0));
+        
+        // 计算亮度并写入 RGBA 通道
+        gl_FragColor = vec4(
+            dot(p0.rgb, W), // R 通道存储第 1 个像素的亮度
+            dot(p1.rgb, W), // G 通道存储第 2 个像素的亮度
+            dot(p2.rgb, W), // B 通道存储第 3 个像素的亮度
+            dot(p3.rgb, W)  // A 通道存储第 4 个像素的亮度
+        );
+    }
+</script>
+
+    <script id="fs-downscale-color" type="x-shader/x-fragment">
+    precision mediump float;
+    uniform sampler2D u_image;
+    varying vec2 v_texCoord;
+
+    // [中文注释] 色彩降采样 Shader
+    // 这是一个简单的纹理采样器，利用 GPU 的线性插值 (Linear Filtering) 自动实现图像缩小。
+    // 用于生成低分辨率的“色彩图”，供星芒染色使用。
+    void main() {
+        gl_FragColor = texture2D(u_image, v_texCoord);
+    }
+</script>
+
     <script type="text/javascript">
         let video = document.getElementById('videoInput');
         let canvas = document.getElementById('glCanvas');
@@ -127,9 +193,16 @@
         let isStaticMode = false;
         let uploadedImage = new Image();
 
-        let programVideo, programStar;
+        let programVideo, programStar, programPackLuma, programDownscaleColor;
         let textureVideo;
         let bufferVideoRect, bufferStar;
+
+        // [Optim] Atlas FBO members
+        let atlasFbo = null;
+        let atlasTexture = null;
+        let atlasWidth = 0;
+        let atlasHeight = 0;
+        let colorScale = 0.25; // 1/4 resolution for color
 
         let params = {
             threshold: 240,
@@ -183,11 +256,20 @@
 
         function initWebGL() {
             programVideo = createProgram(gl, 'vs-video', 'fs-video');
+            programPackLuma = createProgram(gl, 'vs-pack', 'fs-pack-luma');
+            programDownscaleColor = createProgram(gl, 'vs-pack', 'fs-downscale-color');
+
             const bufferData = new Float32Array([
-                -1, -1, 0, 1,
+                -1, -1, 0, 1, // Bottom-Left: UV(0,1) for Image? No. 
+                // Standard Image: Top-Left is 0,0. GL Texture: Bottom-Left is 0,0.
+                // Our vs-video flips Y? No, vs-video passes texCoord.
+                // bufferData Layout: X, Y, U, V
                 1, -1, 1, 1,
                 -1, 1, 0, 0,
                 1, 1, 1, 0
+                // This V=0 at Top (Y=1) means texture is drawn correctly if image is stored "normally" (Top-Down)
+                // BUT video texture in browser is often Top-Down.
+                // Pack Logic: We want to map UV 0..1 to Screen.
             ]);
             bufferVideoRect = gl.createBuffer();
             gl.bindBuffer(gl.ARRAY_BUFFER, bufferVideoRect);
@@ -202,6 +284,55 @@
             gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
             gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
             gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        }
+
+        // [中文注释] 初始化图集 Framebuffer (FBO)
+        // 这里的“图集”用于存储两种数据：
+        // 1. Pack 后的亮度数据 (占据主要区域)
+        // 2. 降采样后的色彩数据 (占据顶部一小块区域)
+        function initAtlasFBO(w, h) {
+            // w, h 是输入视频的分辨率 (如 1080x1440)
+
+            // 亮度图宽度仅需 1/4 (因为 4 个像素压成 1 个 RGBA)
+            let packedW = Math.ceil(w / 4);
+
+            // 色彩图高度为原图高度的 0.25 (可配置)，用于存缩略图
+            let colorH = Math.ceil(h * colorScale);
+
+            // FBO 总高度 = 原始高度 (用于存 Luma) + 色彩图高度
+            let totalH = h + colorH;
+
+            // 缓存机制：如果尺寸没变，就直接复用
+            if (atlasFbo && atlasWidth === packedW && atlasHeight === totalH) return;
+
+            if (atlasFbo) gl.deleteFramebuffer(atlasFbo);
+            if (atlasTexture) gl.deleteTexture(atlasTexture);
+
+            atlasWidth = packedW;
+            atlasHeight = totalH;
+
+            atlasTexture = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, atlasTexture);
+            // 分配显存
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, atlasWidth, atlasHeight, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+
+            // [重要] 这里必须使用 NEAREST 过滤！
+            // 因为亮度数据是"打包"存储的，如果使用 LINEAR 插值，会导致像素混合，
+            // 使得解包出来的亮度值错误 (R 通道混入了 G 通道的值)。
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+            atlasFbo = gl.createFramebuffer();
+            gl.bindFramebuffer(gl.FRAMEBUFFER, atlasFbo);
+            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, atlasTexture, 0);
+
+            let status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+            if (status !== gl.FRAMEBUFFER_COMPLETE) {
+                console.error("FBO incomplete", status);
+            }
+            gl.bindFramebuffer(gl.FRAMEBUFFER, null);
         }
 
         // --- Interface ---
@@ -496,9 +627,59 @@
             for (let key in perfStats) perfStats[key] = 0;
         }
 
+        // [中文注释] 从图集缓冲区获取颜色的辅助函数 (CPU 端)
+        // 
+        // 坐标系转换说明：
+        // 1. OpenGL 纹理坐标 (uv) 原点在左下角。
+        // 2. DOM/Canvas 坐标 (x,y) 原点在左上角。
+        // 3. gl.readPixels 读取的数据是从下到上的 (Bottom-to-Top)。
+        // 
+        // 我们的图集布局 (在 Buffer 中)：
+        // - 索引 0 (Buffer 头部) 对应 FBO 底部 (y=0)。
+        // - 底部存的是亮度数据 (Luma)。
+        // - 顶部存的是色彩数据 (Color)。
+        // 
+        // 所以 Color 数据的 Buffer 偏移量在后面。
+        function getColorFromAtlas(x, y, buffer, atlasW, atlasH, origW, origH) {
+            // 1. 将输入的 Y (Top-Left) 转换为 GL Y (Bottom-Left)
+            let y_gl = origH - y;
+            if (y_gl < 0) y_gl = 0; if (y_gl >= origH) y_gl = origH - 1;
+
+            // 2. 映射到色彩图的坐标空间 (缩小了 0.25 倍)
+            let x_c = Math.floor(x * colorScale);
+            let y_c = Math.floor(y_gl * colorScale);
+
+            // 3. 计算 Buffer 中的行号
+            // 亮度数据占据了 Buffer 的前 origH 行 (Buffer 坐标)。
+            // 色彩数据紧随其后。
+            let colorH = Math.floor(origH * colorScale);
+            if (y_c >= colorH) y_c = colorH - 1;
+
+            let row = origH + y_c;
+
+            // 4. 计算最终索引
+            let idx = (row * atlasW + x_c) * 4;
+
+            if (idx < 0 || idx >= buffer.length) return { r: 0, g: 0, b: 0 };
+
+            return {
+                r: buffer[idx],
+                g: buffer[idx + 1],
+                b: buffer[idx + 2]
+            };
+        }
+
         function renderScene() {
             let t0, t1, tTotal = performance.now();
-            // 1. 绘制底图 (WebGL)
+
+            // 0. 更新图集 FBO 尺寸 (如果分辨率变了)
+            initAtlasFBO(WIDTH, HEIGHT);
+
+            // ===============================================
+            // 1. 绘制底图 (WebGL) - 可视化用
+            // ===============================================
+            gl.bindFramebuffer(gl.FRAMEBUFFER, null); // 绑定回屏幕
+            gl.viewport(0, 0, WIDTH, HEIGHT);
             gl.useProgram(programVideo);
             gl.bindBuffer(gl.ARRAY_BUFFER, bufferVideoRect);
 
@@ -524,34 +705,99 @@
             gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
             // ===============================================
-            // 2. OpenCV 处理 (CPU - 全分辨率)
+            // 2. 绘制到图集 FBO (数据压缩处理)
             // ===============================================
-            let p = matPool;
-
-            // [计时] readPixels (WebGL data is upside down)
             t0 = performance.now();
-            // Directly read into OpenCV Mat data (Zero Copy / Zero Alloc if implemented well by browser)
-            // Note: GL reads bottom-to-top. We will work with the inverted image and flip coordinates at the end.
-            if (p.src && p.src.data) {
-                // p.src.data is a view into WASM memory. readPixels works with views.
-                gl.readPixels(0, 0, WIDTH, HEIGHT, gl.RGBA, gl.UNSIGNED_BYTE, p.src.data);
+            gl.bindFramebuffer(gl.FRAMEBUFFER, atlasFbo);
+            gl.viewport(0, 0, atlasWidth, atlasHeight);
+            gl.disable(gl.SCISSOR_TEST);
+
+            // Pass 1: 打包亮度 (绘制到 FBO 底部区域)
+            // 视口高度设为 HEIGHT，对应 FBO 纹理的 0..HEIGHT 行
+            gl.viewport(0, 0, atlasWidth, HEIGHT);
+            gl.useProgram(programPackLuma);
+            let attPosP = gl.getAttribLocation(programPackLuma, "a_position");
+            let attTexP = gl.getAttribLocation(programPackLuma, "a_texCoord");
+            gl.enableVertexAttribArray(attPosP);
+            gl.vertexAttribPointer(attPosP, 2, gl.FLOAT, false, 16, 0);
+            gl.enableVertexAttribArray(attTexP);
+            gl.vertexAttribPointer(attTexP, 2, gl.FLOAT, false, 16, 8);
+
+            gl.uniform1i(gl.getUniformLocation(programPackLuma, "u_image"), 0);
+            gl.uniform1f(gl.getUniformLocation(programPackLuma, "u_width"), WIDTH);
+            gl.uniform1f(gl.getUniformLocation(programPackLuma, "u_height"), HEIGHT);
+            gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+            // Pass 2: 降采样色彩 (绘制到 FBO 顶部区域)
+            // y 偏移量为 HEIGHT，即接着亮度数据往上画
+            let colorH = Math.ceil(HEIGHT * colorScale);
+            gl.viewport(0, HEIGHT, atlasWidth, colorH);
+            gl.useProgram(programDownscaleColor);
+
+            let attPosC = gl.getAttribLocation(programDownscaleColor, "a_position");
+            let attTexC = gl.getAttribLocation(programDownscaleColor, "a_texCoord");
+            gl.enableVertexAttribArray(attPosC);
+            gl.vertexAttribPointer(attPosC, 2, gl.FLOAT, false, 16, 0);
+            gl.enableVertexAttribArray(attTexC);
+            gl.vertexAttribPointer(attTexC, 2, gl.FLOAT, false, 16, 8);
+
+            gl.uniform1i(gl.getUniformLocation(programDownscaleColor, "u_image"), 0);
+            gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+            t1 = performance.now();
+
+            // ===============================================
+            // 3. 读取像素 (readPixels)
+            // ===============================================
+            // [性能核心] 此时读取的数据量仅为原来的 ~30% (取决于 colorScale)
+            t0 = performance.now();
+            let totalBytes = atlasWidth * atlasHeight * 4;
+            if (!matPool.pixelBuff || matPool.pixelBuff.length !== totalBytes) {
+                matPool.pixelBuff = new Uint8Array(totalBytes);
             }
-            // ImageData mock for getAverageColor
-            let imageData = { data: p.src.data, width: WIDTH, height: HEIGHT };
+            gl.readPixels(0, 0, atlasWidth, atlasHeight, gl.RGBA, gl.UNSIGNED_BYTE, matPool.pixelBuff);
 
             t1 = performance.now();
             perfStats.getImageData += (t1 - t0);
 
-            // [计时] cvtColor
-            t0 = performance.now();
-            cv.cvtColor(p.src, p.gray, cv.COLOR_RGBA2GRAY);
-            t1 = performance.now();
-            perfStats.cvtColor += (t1 - t0);
+            // ===============================================
+            // 4. 解码数据 / OpenCV 准备
+            // ===============================================
+            let p = matPool;
 
-            // [New] Downscale for detection
-            let detectionMat = p.gray;
+            // [Bright Decode] 快速拷贝亮度数据
+            // WebGL 读取的数据是 Bottom-to-Top 的，所以我们得到的 p.gray 实际上是倒立的图。
+            // 这没关系，我们后续处理统一当做倒立图来做，最后画星星时翻转坐标即可。
+            t0 = performance.now();
+            let lumaByteLength = WIDTH * HEIGHT;
+
+            // 检查步长 (Stride) 是否对齐。
+            // atlasWidth * 4 是缓冲区的一行字节数。
+            // WIDTH 是我们需要的一行字节数。
+            // 只有当分辨率宽度是 4 的倍数时，这两者才相等，可以做极速的整块拷贝。
+            if ((atlasWidth * 4) === WIDTH) {
+                p.gray.data.set(matPool.pixelBuff.subarray(0, lumaByteLength));
+            } else {
+                // 如果不对齐 (比如宽度不是 4 的倍数)，需要逐行拷贝
+                let rowBytes = WIDTH;
+                let strideBytes = atlasWidth * 4;
+                for (let r = 0; r < HEIGHT; r++) {
+                    let srcStart = r * strideBytes;
+                    let dstStart = r * rowBytes;
+                    p.gray.data.set(matPool.pixelBuff.subarray(srcStart, srcStart + rowBytes), dstStart);
+                }
+            }
+
+            perfStats.cvtColor += (performance.now() - t0);
+
+            // ===============================================
+            // 5. OpenCV 核心处理 (检测星芒候选点)
+            // ===============================================
+
+            let detectionMat = p.gray; // 注意：此时图像是倒立的！
             let scale = params.detectionScale;
 
+            // [缩放] 为了性能，可以在更小的图上做检测
             if (scale < 1.0) {
                 t0 = performance.now();
                 cv.resize(p.gray, p.smallGray, new cv.Size(0, 0), scale, scale, cv.INTER_LINEAR);
@@ -562,15 +808,14 @@
                 perfStats.resize += 0;
             }
 
-            // [计时] threshold (on small mat)
+            // [阈值] 提取高光点
             t0 = performance.now();
-            // Use smallThresh if scaling, else fallback (logic simplified)
             let threshMat = (scale < 1.0) ? p.smallThresh : p.thresh;
             cv.threshold(detectionMat, threshMat, params.threshold, 255, cv.THRESH_BINARY);
             t1 = performance.now();
             perfStats.threshold += (t1 - t0);
 
-            // [计时] dilate
+            // [膨胀] 连接断开的亮斑
             t0 = performance.now();
             if (params.dilationEnabled) {
                 let M = cv.Mat.ones(params.dilationSize, params.dilationSize, cv.CV_8U);
@@ -581,13 +826,13 @@
             t1 = performance.now();
             perfStats.dilate += (t1 - t0);
 
-            // [计时] findContours
+            // [查找轮廓]
             t0 = performance.now();
             cv.findContours(threshMat, p.contours, p.hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
             t1 = performance.now();
             perfStats.findContours += (t1 - t0);
 
-            // [计时] contourLoop (轮廓遍历处理)
+            // [遍历轮廓] 筛选星星候选
             t0 = performance.now();
             let candidates = [];
             let maxAreaVal = (WIDTH * HEIGHT) / params.maxAreaRatio;
@@ -597,13 +842,11 @@
                 let contour = p.contours.get(i);
                 let areaSmall = cv.contourArea(contour);
 
-                // Map area back to original space for filtering checks
                 let area = areaSmall * (invScale * invScale);
 
                 if (params.minAreaEnabled && area < params.minArea) continue;
                 if (params.maxAreaEnabled && area > maxAreaVal) continue;
 
-                // Map Bounding Rect back
                 let rectSmall = cv.boundingRect(contour);
                 let rect = {
                     x: Math.round(rectSmall.x * invScale),
@@ -612,46 +855,30 @@
                     height: Math.round(rectSmall.height * invScale)
                 };
 
-                // Ensure rect is within bounds
                 if (rect.x < 0) rect.x = 0;
                 if (rect.y < 0) rect.y = 0;
                 if (rect.x + rect.width > WIDTH) rect.width = WIDTH - rect.x;
                 if (rect.y + rect.height > HEIGHT) rect.height = HEIGHT - rect.y;
 
                 if (params.shapeFilterEnabled) {
-                    let whRatio = rect.width / rect.height;
-                    // Aspect ratio is scale-invariant, so calculating from rect is fine
-
-                    // Circularity needs perimeter
-                    let perimeter = cv.arcLength(contour, true);
-                    // Scale perimeter to original space
-                    perimeter = perimeter * invScale;
-
+                    let perimeter = cv.arcLength(contour, true) * invScale;
                     if (perimeter === 0) continue;
                     let circularity = 4 * Math.PI * area / (perimeter * perimeter);
                     if (circularity < params.circularity) continue;
                 }
 
-                // [亚像素级光源追踪] 使用加权质心法计算亚像素精度的光源中心
-                // Note: Image is INVERTED (Upside Down). Rect is also INVERTED coords.
-                // We calculate Centroid in this Inverted Space.
-
-                // 初始化加权质心累加器
+                // [亚像素级光源追踪] 
+                // 计算加权质心 (Weighted Centroid) 以获得极其稳定的星星中心。
+                // 注意：因为图像是倒立的，这里计算出的 cy 也是倒立空间下的坐标。
                 let cxSub = 0, cySub = 0, totalWeight = 0;
-
-                // 获取灰度图数据指针
                 let grayData = p.gray.data;
                 let threshValue = params.threshold;
 
-                // 遍历 bounding rect 内的像素
                 for (let py = rect.y; py < rect.y + rect.height; py++) {
                     for (let px = rect.x; px < rect.x + rect.width; px++) {
                         let idx = py * WIDTH + px;
                         let brightness = grayData[idx];
-
-                        // 只考虑超过阈值的高亮像素
                         if (brightness > threshValue) {
-                            // 使用亮度的平方作为权重，让最亮的点权重指数增长
                             let weight = brightness * brightness;
                             cxSub += px * weight;
                             cySub += py * weight;
@@ -660,23 +887,16 @@
                     }
                 }
 
-                // 计算加权质心 (亚像素精度)
                 let cx, cy;
                 if (totalWeight > 0) {
                     cx = cxSub / totalWeight;
                     cy = cySub / totalWeight;
                 } else {
-                    // 降级：使用 bounding rect 中心
                     cx = rect.x + rect.width / 2;
                     cy = rect.y + rect.height / 2;
                 }
 
-
-                candidates.push({
-                    area: area,
-                    cx: cx,
-                    cy: cy
-                });
+                candidates.push({ area: area, cx: cx, cy: cy });
             }
             t1 = performance.now();
             perfStats.contourLoop += (t1 - t0);
@@ -685,10 +905,11 @@
             if (candidates.length > 40) candidates.length = 40;
 
             // ===============================================
-            // 3. WebGL 星芒绘制 (GPU)
+            // 6. 绘制星芒 (WebGL)
             // ===============================================
-            // [计时] webglDraw
             t0 = performance.now();
+            gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+            gl.viewport(0, 0, WIDTH, HEIGHT);
             gl.useProgram(programStar);
             gl.enable(gl.BLEND);
             gl.blendFunc(gl.ONE, gl.ONE);
@@ -704,12 +925,22 @@
             for (let i = 0; i < candidates.length; i++) {
                 let cand = candidates[i];
 
-                let rawColor = getAverageColor(cand.cx, cand.cy, 2, imageData.data, WIDTH, HEIGHT);
+                // [色彩采样] 
+                // 这里的 cand.cy 是在倒立图中的 Y 坐标 (0 在底部)。
+                // 我们的 Buffer 布局是：底部是 Luma，顶部是 Color。
+                // 我们需要算出该点相对于图像顶部的距离，去 Buffer 的色彩区域采样。
+                // y_top = HEIGHT - cand.cy
+                let y_top = HEIGHT - cand.cy;
+                let rawColor = getColorFromAtlas(cand.cx, y_top, matPool.pixelBuff, atlasWidth, atlasHeight, WIDTH, HEIGHT);
                 let finalColor = adjustSaturation(rawColor.r, rawColor.g, rawColor.b, params.starSaturation);
 
+                // [坐标翻转]
+                // WebGL 绘制时，如果直接用 cand.cy (倒立坐标)，星星会画反。
+                // 需要翻转回屏幕坐标：cy_disp = HEIGHT - cand.cy
                 let cx_disp = cand.cx;
-                let cy_disp = HEIGHT - cand.cy; // Correct Y for WebGL because image was inverted
+                let cy_disp = HEIGHT - cand.cy;
 
+                // 动态调整星芒大小
                 let currentLen = params.starLengthMax;
                 let currentWidthScale = 1.0;
                 let currentOpacity = params.starOpacity;
@@ -742,7 +973,6 @@
             t1 = performance.now();
             perfStats.webglDraw += (t1 - t0);
 
-            // [计时] 总耗时
             perfStats.total += (performance.now() - tTotal);
             perfStats.sampleCount++;
         }
