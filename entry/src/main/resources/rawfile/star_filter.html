@@ -61,18 +61,25 @@
 <script id="vs-video" type="x-shader/x-vertex">
     attribute vec2 a_position;
     attribute vec2 a_texCoord;
+    uniform float u_zoom;
     varying vec2 v_texCoord;
     void main() {
         gl_Position = vec4(a_position, 0.0, 1.0);
-        v_texCoord = a_texCoord;
+        // Zoom from center: map 0..1 to (0.5 - 0.5/z) .. (0.5 + 0.5/z)
+        v_texCoord = (a_texCoord - 0.5) / u_zoom + 0.5;
     }
 </script>
 <script id="fs-video" type="x-shader/x-fragment">
     precision mediump float;
     uniform sampler2D u_image;
+    uniform float u_exposure;
     varying vec2 v_texCoord;
     void main() {
-        gl_FragColor = texture2D(u_image, v_texCoord);
+        vec4 color = texture2D(u_image, v_texCoord);
+        // Always apply power function. 2^0 = 1.0 (no change).
+        // Using abs(exposure) logic if needed, but 2.0^x is safe for -ve x
+        color.rgb *= pow(2.0, u_exposure);
+        gl_FragColor = color;
     }
 </script>
 
@@ -117,10 +124,11 @@
     // 这是一个直通 Shader，不做任何顶点变换，仅传递纹理坐标。
     attribute vec2 a_position;
     attribute vec2 a_texCoord;
+    uniform float u_zoom;
     varying vec2 v_texCoord;
     void main() {
         gl_Position = vec4(a_position, 0.0, 1.0);
-        v_texCoord = a_texCoord;
+        v_texCoord = (a_texCoord - 0.5) / u_zoom + 0.5;
     }
 </script>
 
@@ -129,6 +137,7 @@
     uniform sampler2D u_image;
     uniform float u_width;
     uniform float u_height;
+    uniform float u_exposure;
     varying vec2 v_texCoord;
 
     // [中文注释] 亮度打包 Shader
@@ -155,12 +164,16 @@
         vec4 p2 = texture2D(u_image, uv_center + vec2(0.5 * dx, 0.0));
         vec4 p3 = texture2D(u_image, uv_center + vec2(1.5 * dx, 0.0));
 
+        // Apply exposure gain
+        // Force calculation to prevent uniform optimization
+        float gain = pow(2.0, u_exposure);
+
         // 计算亮度并写入 RGBA 通道
         gl_FragColor = vec4(
-            dot(p0.rgb, W), // R 通道存储第 1 个像素的亮度
-            dot(p1.rgb, W), // G 通道存储第 2 个像素的亮度
-            dot(p2.rgb, W), // B 通道存储第 3 个像素的亮度
-            dot(p3.rgb, W)  // A 通道存储第 4 个像素的亮度
+            dot(p0.rgb, W) * gain, // R 通道存储第 1 个像素的亮度
+            dot(p1.rgb, W) * gain, // G 通道存储第 2 个像素的亮度
+            dot(p2.rgb, W) * gain, // B 通道存储第 3 个像素的亮度
+            dot(p3.rgb, W) * gain  // A 通道存储第 4 个像素的亮度
         );
     }
 </script>
@@ -168,13 +181,16 @@
 <script id="fs-downscale-color" type="x-shader/x-fragment">
     precision mediump float;
     uniform sampler2D u_image;
+    uniform float u_exposure;
     varying vec2 v_texCoord;
 
     // [中文注释] 色彩降采样 Shader
     // 这是一个简单的纹理采样器，利用 GPU 的线性插值 (Linear Filtering) 自动实现图像缩小。
     // 用于生成低分辨率的“色彩图”，供星芒染色使用。
     void main() {
-        gl_FragColor = texture2D(u_image, v_texCoord);
+        vec4 color = texture2D(u_image, v_texCoord);
+        color.rgb *= pow(2.0, u_exposure);
+        gl_FragColor = color;
     }
 </script>
 
@@ -204,6 +220,12 @@
     let atlasHeight = 0;
     let colorScale = 0.25; // 1/4 resolution for color
     let textureNeedsUpdate = false;
+
+    // Software Fallback Variables
+    let digitalZoom = 1.0;
+    let digitalExposure = 0.0;
+    let useHardwareZoom = false;
+    let useHardwareExposure = false;
 
     let params = {
         threshold: 240,
@@ -341,9 +363,16 @@
         params[key] = parseFloat(value);
     };
 
-    // UI Debug Helper - Disabled
+    // UI Debug Helper
     function logToUI(msg, isError = false) {
-        // Disabled
+        let pp = document.getElementById('perfPanel');
+        if (pp) {
+            // Keep only last 5 lines to avoid clutter
+            let lines = pp.innerText.split('\n');
+            if (lines.length > 8) lines = lines.slice(0, 8);
+            pp.innerText = lines.join('\n') + '\n' + (isError ? '[ERR] ' : '') + msg;
+        }
+        console.log(msg);
     }
 
     // Global Error Handler
@@ -374,23 +403,47 @@
     };
 
     window.setZoom = function (value) {
-        if (!stream) return;
-        let track = stream.getVideoTracks()[0];
-        let caps = track.getCapabilities();
-        if (caps.zoom) {
-            track.applyConstraints({ advanced: [{ zoom: value }] })
-                .catch(e => console.error("setZoom failed", e));
+        // [Optim] Prioritize Hardware Zoom
+        if (stream) {
+            let track = stream.getVideoTracks()[0];
+            let caps = track.getCapabilities();
+
+            if (caps.zoom) {
+                useHardwareZoom = true;
+                // Clamp value
+                let hwValue = value;
+                if (hwValue < caps.zoom.min) hwValue = caps.zoom.min;
+                if (hwValue > caps.zoom.max) hwValue = caps.zoom.max;
+
+                track.applyConstraints({ zoom: hwValue })
+                    .catch(e => {
+                        logToUI("HW Zoom Failed, using SW", true);
+                        digitalZoom = value; // Fallback
+                    });
+                // Reset SW zoom if HW works (or we assume it works)
+                digitalZoom = 1.0;
+                return;
+            }
         }
+
+        // Software Fallback
+        useHardwareZoom = false;
+        digitalZoom = value;
+        logToUI(`SW Zoom: ${value.toFixed(2)}x`);
     };
 
     window.setExposure = function (value) {
-        if (!stream) return;
-        let track = stream.getVideoTracks()[0];
-        let caps = track.getCapabilities();
-        if (caps.exposureCompensation) {
-            track.applyConstraints({ advanced: [{ exposureCompensation: value }] })
-                .catch(e => console.error("setExposure failed", e));
-        }
+        // [Fix] Force Software Exposure
+        // Some devices report hardware support (caps.exposureCompensation) but fail to apply it visually.
+        // We bypass hardware check to guarantee functionality via Shader.
+
+        useHardwareExposure = false;
+        digitalExposure = value;
+        logToUI(`SW Exp (Forced): ${value.toFixed(1)} EV`);
+
+        /* Hardware path disabled due to unreliability:
+         if (stream) { ... }
+        */
     };
 
     window.loadStaticImage = function (base64Str) {
@@ -829,6 +882,8 @@
             }
         }
         gl.uniform1i(gl.getUniformLocation(programVideo, "u_image"), 0);
+        gl.uniform1f(gl.getUniformLocation(programVideo, "u_zoom"), digitalZoom);
+        gl.uniform1f(gl.getUniformLocation(programVideo, "u_exposure"), digitalExposure);
         gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
         // ===============================================
@@ -853,6 +908,8 @@
         gl.uniform1i(gl.getUniformLocation(programPackLuma, "u_image"), 0);
         gl.uniform1f(gl.getUniformLocation(programPackLuma, "u_width"), WIDTH);
         gl.uniform1f(gl.getUniformLocation(programPackLuma, "u_height"), HEIGHT);
+        gl.uniform1f(gl.getUniformLocation(programPackLuma, "u_zoom"), digitalZoom);
+        gl.uniform1f(gl.getUniformLocation(programPackLuma, "u_exposure"), digitalExposure);
         gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
         // Pass 2: 降采样色彩 (绘制到 FBO 顶部区域)
@@ -869,6 +926,8 @@
         gl.vertexAttribPointer(attTexC, 2, gl.FLOAT, false, 16, 8);
 
         gl.uniform1i(gl.getUniformLocation(programDownscaleColor, "u_image"), 0);
+        gl.uniform1f(gl.getUniformLocation(programDownscaleColor, "u_zoom"), digitalZoom);
+        gl.uniform1f(gl.getUniformLocation(programDownscaleColor, "u_exposure"), digitalExposure);
         gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
         t1 = performance.now();
@@ -1123,6 +1182,12 @@
                 if (window.etsProxy) window.etsProxy.postMessage(JSON.stringify({ type: 'fps', value: frameCount }));
                 // 输出性能统计
                 logPerformance();
+
+                // [Debug] Verify digital exposure value
+                if (!useHardwareExposure) {
+                    logToUI(`DigExp Check: ${digitalExposure.toFixed(2)}`);
+                }
+
                 frameCount = 0;
                 lastTime = now;
             }
