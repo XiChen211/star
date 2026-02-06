@@ -1,0 +1,807 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>Physics Star Filter Pro (Max Brightness Mode)</title>
+    <style>
+        body,
+        html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            background-color: #000;
+            overflow: hidden;
+        }
+
+        #videoInput {
+            display: none;
+        }
+
+        #bufferCanvas {
+            display: none;
+        }
+
+        #glCanvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+        }
+    </style>
+</head>
+
+<body>
+<video id="videoInput" playsinline autoplay muted></video>
+<canvas id="glCanvas"></canvas>
+<canvas id="bufferCanvas"></canvas>
+
+<!-- 性能显示面板 -->
+<div id="perfPanel" style="
+        position: fixed;
+        top: 10px;
+        left: 10px;
+        background: rgba(0,0,0,0.75);
+        color: #0f0;
+        font-family: monospace;
+        font-size: 12px;
+        padding: 8px 12px;
+        border-radius: 6px;
+        z-index: 9999;
+        pointer-events: none;
+        line-height: 1.5;
+        white-space: pre;
+    ">性能统计加载中...</div>
+
+<script async src="https://docs.opencv.org/4.8.0/opencv.js" onload="onOpenCvReady()"
+        type="text/javascript"></script>
+
+<script id="vs-video" type="x-shader/x-vertex">
+    attribute vec2 a_position;
+    attribute vec2 a_texCoord;
+    varying vec2 v_texCoord;
+    void main() {
+        gl_Position = vec4(a_position, 0.0, 1.0);
+        v_texCoord = a_texCoord;
+    }
+</script>
+<script id="fs-video" type="x-shader/x-fragment">
+    precision mediump float;
+    uniform sampler2D u_image;
+    varying vec2 v_texCoord;
+    void main() {
+        gl_FragColor = texture2D(u_image, v_texCoord);
+    }
+</script>
+
+<script id="vs-star" type="x-shader/x-vertex">
+    attribute vec2 a_position;
+    attribute float a_gradient;
+    uniform vec2 u_resolution;
+    varying float v_gradient;
+    void main() {
+        vec2 zeroToOne = a_position / u_resolution;
+        vec2 zeroToTwo = zeroToOne * 2.0;
+        vec2 clipSpace = zeroToTwo - 1.0;
+        gl_Position = vec4(clipSpace * vec2(1, -1), 0.0, 1.0);
+        v_gradient = a_gradient;
+    }
+</script>
+<script id="fs-star" type="x-shader/x-fragment">
+    precision mediump float;
+    uniform vec4 u_color;
+    uniform float u_opacity;
+    varying float v_gradient;
+
+    void main() {
+        vec4 white = vec4(1.0, 1.0, 1.0, 1.0);
+        vec4 baseColor = vec4(u_color.rgb, 1.0);
+        vec4 outColor;
+
+        if (v_gradient < 0.1) {
+            float t = v_gradient / 0.1;
+            outColor = mix(white, baseColor, t);
+        } else {
+            outColor = baseColor;
+        }
+
+        float alphaFade = 1.0 - smoothstep(0.0, 1.0, v_gradient);
+        gl_FragColor = vec4(outColor.rgb, alphaFade * u_opacity);
+    }
+</script>
+
+<script type="text/javascript">
+    let video = document.getElementById('videoInput');
+    let canvas = document.getElementById('glCanvas');
+    let bufferCanvas = document.getElementById('bufferCanvas');
+
+    let gl = canvas.getContext('webgl', { alpha: false, preserveDrawingBuffer: true });
+    let bufferCtx = bufferCanvas.getContext('2d', { willReadFrequently: true });
+
+    let streaming = false;
+    let stream = null;
+    let animationId = null;
+    let currentFacingMode = 'environment';
+    let isStaticMode = false;
+    let uploadedImage = new Image();
+
+    let programVideo, programStar;
+    let textureVideo;
+    let bufferVideoRect, bufferStar;
+
+    let params = {
+        threshold: 240,
+        dilationEnabled: 1,
+        dilationIter: 1,
+        dilationSize: 1,
+        minAreaEnabled: 1,
+        minArea: 25,
+        maxAreaEnabled: 1,
+        maxAreaRatio: 1000,
+        shapeFilterEnabled: 1,
+        circularity: 0.3, // Reverted to 0.3
+        gradientThreshold: 20,
+        detectionScale: 0.5, // [Optim] Downscale detection
+        starLengthMin: 40,
+        starLengthMax: 120,
+        starOpacity: 0.8,
+        starPoints: 4,
+        starAngle: 0,
+        starSaturation: 1.0
+    };
+
+    let matPool = {
+        src: null, gray: null, thresh: null, kernel: null, contours: null, hierarchy: null,
+        smallGray: null, smallThresh: null // [Optim] Aux mats
+    };
+
+    let WIDTH = 1080;
+    let HEIGHT = 1440;
+
+    // --- WebGL Helpers ---
+    function createShader(gl, type, source) {
+        const shader = gl.createShader(type);
+        gl.shaderSource(shader, source);
+        gl.compileShader(shader);
+        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+            gl.deleteShader(shader);
+            return null;
+        }
+        return shader;
+    }
+
+    function createProgram(gl, vsId, fsId) {
+        const vs = createShader(gl, gl.VERTEX_SHADER, document.getElementById(vsId).text);
+        const fs = createShader(gl, gl.FRAGMENT_SHADER, document.getElementById(fsId).text);
+        const program = gl.createProgram();
+        gl.attachShader(program, vs);
+        gl.attachShader(program, fs);
+        gl.linkProgram(program);
+        return program;
+    }
+
+    function initWebGL() {
+        programVideo = createProgram(gl, 'vs-video', 'fs-video');
+        const bufferData = new Float32Array([
+            -1, -1, 0, 1,
+            1, -1, 1, 1,
+            -1, 1, 0, 0,
+            1, 1, 1, 0
+        ]);
+        bufferVideoRect = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, bufferVideoRect);
+        gl.bufferData(gl.ARRAY_BUFFER, bufferData, gl.STATIC_DRAW);
+
+        programStar = createProgram(gl, 'vs-star', 'fs-star');
+        bufferStar = gl.createBuffer();
+
+        textureVideo = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, textureVideo);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    }
+
+    // --- Interface ---
+    window.updateParam = function (key, value) {
+        params[key] = parseFloat(value);
+    };
+
+    window.switchCamera = function () {
+        isStaticMode = false;
+        currentFacingMode = (currentFacingMode === 'user') ? 'environment' : 'user';
+        stopCamera();
+        startCamera();
+    };
+
+    window.toggleCamera = function (shouldEnable) {
+        if (shouldEnable) {
+            if (isStaticMode) {
+                isStaticMode = false;
+                stopCamera();
+                startCamera();
+            } else {
+                if (!streaming) startCamera();
+            }
+        } else {
+            if (!isStaticMode) stopCamera();
+        }
+    };
+
+    window.loadStaticImage = function (base64Str) {
+        stopCamera();
+        uploadedImage.onload = function () {
+            isStaticMode = true;
+            streaming = true;
+
+            WIDTH = uploadedImage.width;
+            HEIGHT = uploadedImage.height;
+
+            const MAX_SIDE = 1920;
+            if (WIDTH > MAX_SIDE || HEIGHT > MAX_SIDE) {
+                let ratio = WIDTH / HEIGHT;
+                if (WIDTH > HEIGHT) {
+                    WIDTH = MAX_SIDE;
+                    HEIGHT = Math.floor(MAX_SIDE / ratio);
+                } else {
+                    HEIGHT = MAX_SIDE;
+                    WIDTH = Math.floor(MAX_SIDE * ratio);
+                }
+            }
+
+            canvas.width = WIDTH;
+            canvas.height = HEIGHT;
+            bufferCanvas.width = WIDTH;
+            bufferCanvas.height = HEIGHT;
+
+            gl.viewport(0, 0, WIDTH, HEIGHT);
+
+            initMats();
+            if (animationId) cancelAnimationFrame(animationId);
+            requestAnimationFrame(processVideo);
+        };
+        uploadedImage.src = base64Str;
+    };
+
+    window.captureImage = function () {
+        if (!streaming) return;
+        renderScene();
+        let dataURL = canvas.toDataURL('image/png', 1.0);
+        if (window.etsProxy) {
+            window.etsProxy.postMessage(JSON.stringify({ type: 'capture', data: dataURL }));
+        }
+    };
+
+    function onOpenCvReady() {
+        initWebGL();
+        if (window.etsProxy) window.etsProxy.postMessage(JSON.stringify({ type: 'status', msg: 'ready' }));
+    }
+
+    function initMats() {
+        if (!cv) return;
+        if (matPool.contours) matPool.contours.delete();
+        if (matPool.hierarchy) matPool.hierarchy.delete();
+        if (matPool.kernel) matPool.kernel.delete();
+        for (let key in matPool) {
+            if (matPool[key] && matPool[key].delete) matPool[key].delete();
+        }
+
+        matPool.src = new cv.Mat(HEIGHT, WIDTH, cv.CV_8UC4);
+        matPool.gray = new cv.Mat(HEIGHT, WIDTH, cv.CV_8UC1);
+
+        // [Optim] Init downscaled mats
+        let sW = Math.floor(WIDTH * params.detectionScale);
+        let sH = Math.floor(HEIGHT * params.detectionScale);
+        matPool.smallGray = new cv.Mat(sH, sW, cv.CV_8UC1);
+        matPool.smallThresh = new cv.Mat(sH, sW, cv.CV_8UC1);
+
+        matPool.thresh = new cv.Mat(HEIGHT, WIDTH, cv.CV_8UC1); // Keep for legacy or fallback if needed
+        matPool.contours = new cv.MatVector();
+        matPool.hierarchy = new cv.Mat();
+    }
+
+    function getAverageColor(x, y, radius, imgData, width, height) {
+        let r = 0, g = 0, b = 0, count = 0;
+        let startX = Math.max(0, Math.floor(x - radius));
+        let endX = Math.min(width - 1, Math.ceil(x + radius));
+        let startY = Math.max(0, Math.floor(y - radius));
+        let endY = Math.min(height - 1, Math.ceil(y + radius));
+
+        for (let py = startY; py <= endY; py++) {
+            for (let px = startX; px <= endX; px++) {
+                let idx = (py * width + px) * 4;
+                r += imgData[idx];
+                g += imgData[idx + 1];
+                b += imgData[idx + 2];
+                count++;
+            }
+        }
+        if (count === 0) return { r: 255, g: 255, b: 255 };
+        return { r: Math.round(r / count), g: Math.round(g / count), b: Math.round(b / count) };
+    }
+
+    // [New] Texture Analysis: Check local contrast/gradient at (x, y)
+    function getGradientSharpness(x, y, radius, imgData, width, height) {
+        let cx = Math.round(x);
+        let cy = Math.round(y);
+        let minVal = 255;
+        let maxVal = 0;
+        let count = 0;
+
+        // Check a small neighborhood around the center
+        for (let dy = -radius; dy <= radius; dy++) {
+            for (let dx = -radius; dx <= radius; dx++) {
+                let px = cx + dx;
+                let py = cy + dy;
+                if (px < 0 || px >= width || py < 0 || py >= height) continue;
+
+                // Use Green channel as proxy for brightness (simple & fast)
+                let idx = (py * width + px) * 4 + 1;
+                let val = imgData[idx];
+
+                if (val < minVal) minVal = val;
+                if (val > maxVal) maxVal = val;
+                count++;
+            }
+        }
+        if (count < 2) return 0;
+        return (maxVal - minVal);
+    }
+
+    function adjustSaturation(r, g, b, saturation) {
+        if (saturation === 1.0) return { r, g, b };
+        const gray = 0.299 * r + 0.587 * g + 0.114 * b;
+        return {
+            r: Math.min(255, Math.max(0, gray + (r - gray) * saturation)),
+            g: Math.min(255, Math.max(0, gray + (g - gray) * saturation)),
+            b: Math.min(255, Math.max(0, gray + (b - gray) * saturation))
+        };
+    }
+
+    function addStarVertices(vertexArray, cx, cy, size, points, baseAngle, widthScale) {
+        let r = size / 2;
+        let numStreaks = points / 2;
+        let angleStep = 180 / numStreaks;
+
+        for (let i = 0; i < numStreaks; i++) {
+            let currentAngleDeg = baseAngle + (i * angleStep);
+
+            let streakLen = r;
+            let streakWidth = 2.0 * widthScale;
+
+            if (points === 8 && (i % 2 !== 0)) {
+                streakLen = r * 0.7;
+                streakWidth = 1.5 * widthScale;
+            }
+
+            let rad = currentAngleDeg * Math.PI / 180.0;
+            let cos = Math.cos(rad);
+            let sin = Math.sin(rad);
+
+            let x1 = cx + cos * streakLen;
+            let y1 = cy + sin * streakLen;
+            let x2 = cx + Math.cos(rad + Math.PI / 2) * streakWidth;
+            let y2 = cy + Math.sin(rad + Math.PI / 2) * streakWidth;
+            let x3 = cx - cos * streakLen;
+            let y3 = cy - sin * streakLen;
+            let x4 = cx + Math.cos(rad - Math.PI / 2) * streakWidth;
+            let y4 = cy + Math.sin(rad - Math.PI / 2) * streakWidth;
+
+            vertexArray.push(x2, y2, 0.0);
+            vertexArray.push(x1, y1, 1.0);
+            vertexArray.push(x4, y4, 0.0);
+
+            vertexArray.push(x2, y2, 0.0);
+            vertexArray.push(x3, y3, 1.0);
+            vertexArray.push(x4, y4, 0.0);
+        }
+    }
+
+    function startCamera() {
+        isStaticMode = false;
+        stopCamera();
+
+        let constraints = {
+            audio: false,
+            video: {
+                facingMode: currentFacingMode,
+                width: { ideal: 1920 },
+                height: { ideal: 1440 }
+            }
+        };
+
+        navigator.mediaDevices.getUserMedia(constraints).then(function (s) {
+            stream = s;
+            video.srcObject = stream;
+            video.play();
+            video.onplaying = () => { streaming = true; };
+
+            video.oncanplay = function () {
+                let vw = video.videoWidth;
+                let vh = video.videoHeight;
+                if (vw && vh) {
+                    WIDTH = vw;
+                    HEIGHT = vh;
+                } else {
+                    WIDTH = 1080; HEIGHT = 1440;
+                }
+
+                canvas.width = WIDTH;
+                canvas.height = HEIGHT;
+                bufferCanvas.width = WIDTH;
+                bufferCanvas.height = HEIGHT;
+
+                gl.viewport(0, 0, WIDTH, HEIGHT);
+
+                streaming = true;
+                initMats();
+                if (animationId) cancelAnimationFrame(animationId);
+                requestAnimationFrame(processVideo);
+            };
+        }).catch(err => {
+            if (window.etsProxy) window.etsProxy.postMessage(JSON.stringify({ type: 'error', msg: err.toString() }));
+        });
+    }
+
+    function stopCamera() {
+        streaming = false;
+        if (animationId) { cancelAnimationFrame(animationId); animationId = null; }
+        if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+        video.pause();
+        video.srcObject = null;
+        gl.clearColor(0, 0, 0, 1);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+    }
+
+    let lastTime = Date.now();
+    let frameCount = 0;
+
+    // === 性能计时器 ===
+    let perfStats = {
+        getImageData: 0,
+        cvtColor: 0,
+        resize: 0, // [Optim] New metric
+        threshold: 0,
+        dilate: 0,
+        findContours: 0,
+        contourLoop: 0,
+        webglDraw: 0,
+        total: 0,
+        sampleCount: 0
+    };
+
+    function logPerformance() {
+        if (perfStats.sampleCount === 0) return;
+        let n = perfStats.sampleCount;
+        let msg = `[性能统计 - ${n}帧平均]\n` +
+            `  总耗时: ${(perfStats.total / n).toFixed(2)}ms\n` +
+            `  ├─ getImageData: ${(perfStats.getImageData / n).toFixed(2)}ms\n` +
+            `  ├─ cvtColor: ${(perfStats.cvtColor / n).toFixed(2)}ms\n` +
+            `  ├─ resize: ${(perfStats.resize / n).toFixed(2)}ms\n` +
+            `  ├─ threshold: ${(perfStats.threshold / n).toFixed(2)}ms\n` +
+            `  ├─ dilate: ${(perfStats.dilate / n).toFixed(2)}ms\n` +
+            `  ├─ findContours: ${(perfStats.findContours / n).toFixed(2)}ms\n` +
+            `  ├─ contourLoop: ${(perfStats.contourLoop / n).toFixed(2)}ms\n` +
+            `  └─ webglDraw: ${(perfStats.webglDraw / n).toFixed(2)}ms`;
+        console.log(msg);
+
+        // 更新页面上的性能面板
+        let panel = document.getElementById('perfPanel');
+        if (panel) {
+            panel.textContent = `性能统计 (${n}帧平均)\n` +
+                `分辨率: ${WIDTH} x ${HEIGHT}\n` +
+                `总耗时: ${(perfStats.total / n).toFixed(1)}ms\n` +
+                `─────────────────\n` +
+                `getImageData: ${(perfStats.getImageData / n).toFixed(1)}ms\n` +
+                `cvtColor:     ${(perfStats.cvtColor / n).toFixed(1)}ms\n` +
+                `threshold:    ${(perfStats.threshold / n).toFixed(1)}ms\n` +
+                `dilate:       ${(perfStats.dilate / n).toFixed(1)}ms\n` +
+                `findContours: ${(perfStats.findContours / n).toFixed(1)}ms\n` +
+                `contourLoop:  ${(perfStats.contourLoop / n).toFixed(1)}ms\n` +
+                `webglDraw:    ${(perfStats.webglDraw / n).toFixed(1)}ms`;
+        }
+
+        if (window.etsProxy) {
+            window.etsProxy.postMessage(JSON.stringify({
+                type: 'perf', data: {
+                    total: (perfStats.total / n).toFixed(2),
+                    getImageData: (perfStats.getImageData / n).toFixed(2),
+                    cvtColor: (perfStats.cvtColor / n).toFixed(2),
+                    threshold: (perfStats.threshold / n).toFixed(2),
+                    dilate: (perfStats.dilate / n).toFixed(2),
+                    findContours: (perfStats.findContours / n).toFixed(2),
+                    contourLoop: (perfStats.contourLoop / n).toFixed(2),
+                    webglDraw: (perfStats.webglDraw / n).toFixed(2)
+                }
+            }));
+        }
+        // 重置
+        for (let key in perfStats) perfStats[key] = 0;
+    }
+
+    function renderScene() {
+        let t0, t1, tTotal = performance.now();
+        // 1. 绘制底图 (WebGL)
+        gl.useProgram(programVideo);
+        gl.bindBuffer(gl.ARRAY_BUFFER, bufferVideoRect);
+
+        let posLoc = gl.getAttribLocation(programVideo, "a_position");
+        let texLoc = gl.getAttribLocation(programVideo, "a_texCoord");
+
+        gl.enableVertexAttribArray(posLoc);
+        gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 16, 0);
+        gl.enableVertexAttribArray(texLoc);
+        gl.vertexAttribPointer(texLoc, 2, gl.FLOAT, false, 16, 8);
+
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, textureVideo);
+
+        if (isStaticMode) {
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, uploadedImage);
+        } else {
+            if (video.readyState >= 2) {
+                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+            }
+        }
+        gl.uniform1i(gl.getUniformLocation(programVideo, "u_image"), 0);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+        // ===============================================
+        // 2. OpenCV 处理 (CPU - 全分辨率)
+        // ===============================================
+        if (isStaticMode) {
+            bufferCtx.drawImage(uploadedImage, 0, 0, WIDTH, HEIGHT);
+        } else if (video.readyState >= 2) {
+            bufferCtx.drawImage(video, 0, 0, WIDTH, HEIGHT);
+        }
+
+        let p = matPool;
+
+        // [计时] getImageData
+        t0 = performance.now();
+        let imageData = bufferCtx.getImageData(0, 0, WIDTH, HEIGHT);
+        p.src.data.set(imageData.data);
+        t1 = performance.now();
+        perfStats.getImageData += (t1 - t0);
+
+        // [计时] cvtColor
+        t0 = performance.now();
+        cv.cvtColor(p.src, p.gray, cv.COLOR_RGBA2GRAY);
+        t1 = performance.now();
+        perfStats.cvtColor += (t1 - t0);
+
+        // [New] Downscale for detection
+        let detectionMat = p.gray;
+        let scale = params.detectionScale;
+
+        if (scale < 1.0) {
+            t0 = performance.now();
+            cv.resize(p.gray, p.smallGray, new cv.Size(0, 0), scale, scale, cv.INTER_LINEAR);
+            detectionMat = p.smallGray;
+            t1 = performance.now();
+            perfStats.resize += (t1 - t0);
+        } else {
+            perfStats.resize += 0;
+        }
+
+        // [计时] threshold (on small mat)
+        t0 = performance.now();
+        // Use smallThresh if scaling, else fallback (logic simplified)
+        let threshMat = (scale < 1.0) ? p.smallThresh : p.thresh;
+        cv.threshold(detectionMat, threshMat, params.threshold, 255, cv.THRESH_BINARY);
+        t1 = performance.now();
+        perfStats.threshold += (t1 - t0);
+
+        // [计时] dilate
+        t0 = performance.now();
+        if (params.dilationEnabled) {
+            let M = cv.Mat.ones(params.dilationSize, params.dilationSize, cv.CV_8U);
+            let anchor = new cv.Point(-1, -1);
+            cv.dilate(threshMat, threshMat, M, anchor, params.dilationIter, cv.BORDER_CONSTANT, cv.morphologyDefaultBorderValue());
+            M.delete();
+        }
+        t1 = performance.now();
+        perfStats.dilate += (t1 - t0);
+
+        // [计时] findContours
+        t0 = performance.now();
+        cv.findContours(threshMat, p.contours, p.hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+        t1 = performance.now();
+        perfStats.findContours += (t1 - t0);
+
+        // [计时] contourLoop (轮廓遍历处理)
+        t0 = performance.now();
+        let candidates = [];
+        let maxAreaVal = (WIDTH * HEIGHT) / params.maxAreaRatio;
+        let invScale = 1.0 / scale;
+
+        for (let i = 0; i < p.contours.size(); ++i) {
+            let contour = p.contours.get(i);
+            let areaSmall = cv.contourArea(contour);
+
+            // Map area back to original space for filtering checks
+            let area = areaSmall * (invScale * invScale);
+
+            if (params.minAreaEnabled && area < params.minArea) continue;
+            if (params.maxAreaEnabled && area > maxAreaVal) continue;
+
+            // Map Bounding Rect back
+            let rectSmall = cv.boundingRect(contour);
+            let rect = {
+                x: Math.round(rectSmall.x * invScale),
+                y: Math.round(rectSmall.y * invScale),
+                width: Math.round(rectSmall.width * invScale),
+                height: Math.round(rectSmall.height * invScale)
+            };
+
+            // Ensure rect is within bounds
+            if (rect.x < 0) rect.x = 0;
+            if (rect.y < 0) rect.y = 0;
+            if (rect.x + rect.width > WIDTH) rect.width = WIDTH - rect.x;
+            if (rect.y + rect.height > HEIGHT) rect.height = HEIGHT - rect.y;
+
+            if (params.shapeFilterEnabled) {
+                let whRatio = rect.width / rect.height;
+                // Aspect ratio is scale-invariant, so calculating from rect is fine
+
+                // Circularity needs perimeter
+                let perimeter = cv.arcLength(contour, true);
+                // Scale perimeter to original space
+                perimeter = perimeter * invScale;
+
+                if (perimeter === 0) continue;
+                let circularity = 4 * Math.PI * area / (perimeter * perimeter);
+                if (circularity < params.circularity) continue;
+            }
+
+            // [亚像素级光源追踪] 使用加权质心法计算亚像素精度的光源中心
+            // Note: We use the ORIGINAL 'p.gray' (High Res) and the mapped 'rect' for precision.
+            // This is the "Hybrid Precision" magic. Let findContours be sloppy, but Centroid be precise.
+
+            // 初始化加权质心累加器
+            let cxSub = 0, cySub = 0, totalWeight = 0;
+
+            // 获取灰度图数据指针
+            let grayData = p.gray.data;
+            let threshValue = params.threshold;
+
+            // 遍历 bounding rect 内的像素
+            for (let py = rect.y; py < rect.y + rect.height; py++) {
+                for (let px = rect.x; px < rect.x + rect.width; px++) {
+                    let idx = py * WIDTH + px;
+                    let brightness = grayData[idx];
+
+                    // 只考虑超过阈值的高亮像素
+                    if (brightness > threshValue) {
+                        // 使用亮度的平方作为权重，让最亮的点权重指数增长
+                        let weight = brightness * brightness;
+                        cxSub += px * weight;
+                        cySub += py * weight;
+                        totalWeight += weight;
+                    }
+                }
+            }
+
+            // 计算加权质心 (亚像素精度)
+            let cx, cy;
+            if (totalWeight > 0) {
+                cx = cxSub / totalWeight;
+                cy = cySub / totalWeight;
+            } else {
+                // 降级：使用 bounding rect 中心
+                cx = rect.x + rect.width / 2;
+                cy = rect.y + rect.height / 2;
+            }
+
+            // [New] Texture/Gradient Filter
+            // Check if the center of the light source is "sharp" enough
+            // Clouds and faces are usually smooth (low gradient)
+            if (params.gradientThreshold > 0) {
+                // We need to access the original image data (or gray) to check sharpness
+                // Since 'imageData' is available in scope (from getImageData earlier), use it.
+                let sharpness = getGradientSharpness(cx, cy, 2, imageData.data, WIDTH, HEIGHT);
+                if (sharpness < params.gradientThreshold) continue;
+            }
+
+            candidates.push({
+                area: area,
+                cx: cx,
+                cy: cy
+            });
+        }
+        t1 = performance.now();
+        perfStats.contourLoop += (t1 - t0);
+
+        candidates.sort((a, b) => b.area - a.area);
+        if (candidates.length > 40) candidates.length = 40;
+
+        // ===============================================
+        // 3. WebGL 星芒绘制 (GPU)
+        // ===============================================
+        // [计时] webglDraw
+        t0 = performance.now();
+        gl.useProgram(programStar);
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.ONE, gl.ONE);
+
+        gl.uniform2f(gl.getUniformLocation(programStar, "u_resolution"), WIDTH, HEIGHT);
+        let locColor = gl.getUniformLocation(programStar, "u_color");
+        let locOpacity = gl.getUniformLocation(programStar, "u_opacity");
+        let locPos = gl.getAttribLocation(programStar, "a_position");
+        let locGrad = gl.getAttribLocation(programStar, "a_gradient");
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, bufferStar);
+
+        for (let i = 0; i < candidates.length; i++) {
+            let cand = candidates[i];
+
+            let rawColor = getAverageColor(cand.cx, cand.cy, 2, imageData.data, WIDTH, HEIGHT);
+            let finalColor = adjustSaturation(rawColor.r, rawColor.g, rawColor.b, params.starSaturation);
+
+            let cx_disp = cand.cx;
+            let cy_disp = cand.cy;
+
+            let currentLen = params.starLengthMax;
+            let currentWidthScale = 1.0;
+            let currentOpacity = params.starOpacity;
+
+            if (params.starLengthMin < params.starLengthMax) {
+                let areaRatio = (cand.area - params.minArea) / (maxAreaVal - params.minArea);
+                if (areaRatio < 0) areaRatio = 0; if (areaRatio > 1) areaRatio = 1;
+                currentLen = params.starLengthMin + (params.starLengthMax - params.starLengthMin) * Math.sqrt(areaRatio);
+                currentWidthScale = 1.0 + areaRatio * 2.0;
+                currentOpacity = params.starOpacity * (0.6 + 0.4 * Math.sqrt(areaRatio));
+            }
+
+            let vertices = [];
+            addStarVertices(vertices, cx_disp, cy_disp, currentLen * 2, params.starPoints, params.starAngle, currentWidthScale);
+
+            gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(vertices), gl.DYNAMIC_DRAW);
+
+            gl.uniform4f(locColor, finalColor.r / 255, finalColor.g / 255, finalColor.b / 255, 1.0);
+            gl.uniform1f(locOpacity, currentOpacity);
+
+            gl.enableVertexAttribArray(locPos);
+            gl.vertexAttribPointer(locPos, 2, gl.FLOAT, false, 12, 0);
+            gl.enableVertexAttribArray(locGrad);
+            gl.vertexAttribPointer(locGrad, 1, gl.FLOAT, false, 12, 8);
+
+            gl.drawArrays(gl.TRIANGLES, 0, vertices.length / 3);
+        }
+
+        gl.disable(gl.BLEND);
+        t1 = performance.now();
+        perfStats.webglDraw += (t1 - t0);
+
+        // [计时] 总耗时
+        perfStats.total += (performance.now() - tTotal);
+        perfStats.sampleCount++;
+    }
+
+    function processVideo() {
+        if (!streaming) return;
+        try {
+            renderScene();
+
+            frameCount++;
+            let now = Date.now();
+            if (now - lastTime >= 1000) {
+                if (window.etsProxy) window.etsProxy.postMessage(JSON.stringify({ type: 'fps', value: frameCount }));
+                // 输出性能统计
+                logPerformance();
+                frameCount = 0;
+                lastTime = now;
+            }
+            animationId = requestAnimationFrame(processVideo);
+        } catch (err) {
+            console.error(err);
+            animationId = requestAnimationFrame(processVideo);
+        }
+    }
+</script>
+</body>
+
+</html>

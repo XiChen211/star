@@ -1,0 +1,7 @@
+{
+  "string": [
+    { "name": "EntryAbility_label", "value": "物理星光镜" },
+    { "name": "reason_camera", "value": "需要相机权限以拍摄画面" },
+    { "name": "reason_gallery", "value": "需要访问相册以保存照片" }
+  ]
+}
