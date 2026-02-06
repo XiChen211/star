@@ -526,18 +526,26 @@
             // ===============================================
             // 2. OpenCV 处理 (CPU - 全分辨率)
             // ===============================================
-            if (isStaticMode) {
-                bufferCtx.drawImage(uploadedImage, 0, 0, WIDTH, HEIGHT);
-            } else if (video.readyState >= 2) {
-                bufferCtx.drawImage(video, 0, 0, WIDTH, HEIGHT);
-            }
-
             let p = matPool;
 
-            // [计时] getImageData
+            // [计时] readPixels (WebGL 直接读取，替代 getImageData)
             t0 = performance.now();
-            let imageData = bufferCtx.getImageData(0, 0, WIDTH, HEIGHT);
-            p.src.data.set(imageData.data);
+            // 创建临时 buffer 存储像素数据
+            let pixelBuffer = new Uint8Array(WIDTH * HEIGHT * 4);
+            gl.readPixels(0, 0, WIDTH, HEIGHT, gl.RGBA, gl.UNSIGNED_BYTE, pixelBuffer);
+
+            // gl.readPixels 读取的图像是 Y 轴翻转的，需要翻转回来
+            let flippedBuffer = new Uint8Array(WIDTH * HEIGHT * 4);
+            let rowSize = WIDTH * 4;
+            for (let y = 0; y < HEIGHT; y++) {
+                let srcRow = (HEIGHT - 1 - y) * rowSize;
+                let dstRow = y * rowSize;
+                flippedBuffer.set(pixelBuffer.subarray(srcRow, srcRow + rowSize), dstRow);
+            }
+
+            p.src.data.set(flippedBuffer);
+            // 为后续 getAverageColor 保留 imageData 引用
+            let imageData = { data: flippedBuffer, width: WIDTH, height: HEIGHT };
             t1 = performance.now();
             perfStats.getImageData += (t1 - t0);
 

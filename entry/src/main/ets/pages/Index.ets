@@ -91,7 +91,6 @@ struct Index {
   @State maxAreaRatio: number = 1000; // 1/N
   @State shapeFilterEnabled: boolean = true;
   @State circularity: number = 0.3;
-  @State gradientThreshold: number = 20;
 
   // 3. 星芒 (Starburst)
   @State starLengthMin: number = 40;
@@ -276,7 +275,6 @@ struct Index {
     this.updateWebParam('maxAreaRatio', this.maxAreaRatio);
     this.updateWebParam('shapeFilterEnabled', this.shapeFilterEnabled);
     this.updateWebParam('circularity', this.circularity);
-    this.updateWebParam('gradientThreshold', this.gradientThreshold);
 
     this.updateWebParam('starLengthMin', this.starLengthMin);
     this.updateWebParam('starLengthMax', this.starLengthMax);
@@ -401,10 +399,6 @@ struct Index {
                   ControlSlider({ label: '圆形度阈值', value: $circularity, min: 0.1, max: 1.0, step: 0.05, color: '#A78BFA', onValueChange: (v) => this.updateWebParam('circularity', v) })
                 }
 
-                Divider().color('rgba(255,255,255,0.1)').margin({top: 4, bottom: 4})
-
-                ControlSlider({ label: '梯度(锐度)阈值', value: $gradientThreshold, min: 0, max: 100, step: 1, color: '#EB4D4B', onValueChange: (v) => this.updateWebParam('gradientThreshold', v) })
-                Text('说明: 阈值越高，过滤越强，云层/人脸越不容易误检').fontSize(10).fontColor('rgba(255,255,255,0.5)').margin({top: 2})
 
               } else if (this.currentCategory === '星芒') {
                 ControlSlider({ label: '最小星芒长度', value: $starLengthMin, min: 10, max: 200, step: 5, color: '#FCD34D', onValueChange: (v) => this.updateWebParam('starLengthMin', v) })
