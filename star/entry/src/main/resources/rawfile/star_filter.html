@@ -203,6 +203,7 @@
         let atlasWidth = 0;
         let atlasHeight = 0;
         let colorScale = 0.25; // 1/4 resolution for color
+        let textureNeedsUpdate = false;
 
         let params = {
             threshold: 240,
@@ -340,6 +341,17 @@
             params[key] = parseFloat(value);
         };
 
+        // UI Debug Helper - Disabled
+        function logToUI(msg, isError = false) {
+            // Disabled
+        }
+
+        // Global Error Handler
+        window.onerror = function (msg, url, lineNo, columnNo, error) {
+            // logToUI(`Global Error: ${msg} @ ${lineNo}:${columnNo}`, true);
+            return false;
+        };
+
         window.switchCamera = function () {
             isStaticMode = false;
             currentFacingMode = (currentFacingMode === 'user') ? 'environment' : 'user';
@@ -362,10 +374,34 @@
         };
 
         window.loadStaticImage = function (base64Str) {
+            let len = base64Str ? base64Str.length : 0;
+            logToUI('loadStaticImage called, len: ' + len);
+            if (window.etsProxy) window.etsProxy.postMessage(JSON.stringify({ type: 'log', msg: 'loadStaticImage called, length: ' + len }));
+
             stopCamera();
+
+            // Hide perf panel in static mode
+            let pp = document.getElementById('perfPanel');
+            if (pp) pp.style.display = 'none';
+
+            // Auto-fix prefix if missing
+            if (base64Str && !base64Str.startsWith('data:image')) {
+                logToUI('Warning: Missing data prefix, auto-fixing...');
+                if (window.etsProxy) window.etsProxy.postMessage(JSON.stringify({ type: 'log', msg: 'Adding missing data prefix' }));
+                base64Str = 'data:image/jpeg;base64,' + base64Str;
+            }
+
+            uploadedImage.onerror = function (e) {
+                logToUI('Image load FAILED', true);
+                if (window.etsProxy) window.etsProxy.postMessage(JSON.stringify({ type: 'error', msg: 'Image load failed' }));
+            };
+
             uploadedImage.onload = function () {
+                logToUI(`Image loaded successfully: ${uploadedImage.width}x${uploadedImage.height}`);
+                if (window.etsProxy) window.etsProxy.postMessage(JSON.stringify({ type: 'log', msg: 'Image loaded: ' + uploadedImage.width + 'x' + uploadedImage.height }));
                 isStaticMode = true;
                 streaming = true;
+                textureNeedsUpdate = true;
 
                 WIDTH = uploadedImage.width;
                 HEIGHT = uploadedImage.height;
@@ -408,31 +444,71 @@
         // 测试111111
 
         function onOpenCvReady() {
+            logToUI("OpenCV Ready callback");
             initWebGL();
+            // If we are already in static mode (image loaded before cv ready), force texture update
+            if (isStaticMode) {
+                textureNeedsUpdate = true;
+                initMats();
+            }
             if (window.etsProxy) window.etsProxy.postMessage(JSON.stringify({ type: 'status', msg: 'ready' }));
         }
 
         function initMats() {
-            if (!cv) return;
-            if (matPool.contours) matPool.contours.delete();
-            if (matPool.hierarchy) matPool.hierarchy.delete();
-            if (matPool.kernel) matPool.kernel.delete();
-            for (let key in matPool) {
-                if (matPool[key] && matPool[key].delete) matPool[key].delete();
+            if (typeof cv === 'undefined') return;
+
+            // Helper for safe deletion
+            const safeDelete = (key) => {
+                let obj = matPool[key];
+                if (obj) {
+                    try {
+                        if (obj.delete && !obj.isDeleted) {
+                            obj.delete();
+                        }
+                    } catch (e) {
+                        // Ignore already deleted errors
+                    }
+                    matPool[key] = null;
+                }
+            };
+
+            try {
+                // 1. Cleanup ALL existing mats
+                safeDelete('contours');
+                safeDelete('hierarchy');
+                safeDelete('kernel');
+                safeDelete('src');
+                safeDelete('gray');
+                safeDelete('smallGray');
+                safeDelete('smallThresh');
+                safeDelete('thresh');
+
+                // 2. Clear any other keys just in case
+                for (let key in matPool) {
+                    if (matPool[key] && matPool[key].delete) {
+                        safeDelete(key);
+                    }
+                }
+
+                // 3. Re-allocate
+                matPool.src = new cv.Mat(HEIGHT, WIDTH, cv.CV_8UC4);
+                matPool.gray = new cv.Mat(HEIGHT, WIDTH, cv.CV_8UC1);
+
+                // [Optim] Init downscaled mats
+                let sW = Math.floor(WIDTH * params.detectionScale);
+                let sH = Math.floor(HEIGHT * params.detectionScale);
+                matPool.smallGray = new cv.Mat(sH, sW, cv.CV_8UC1);
+                matPool.smallThresh = new cv.Mat(sH, sW, cv.CV_8UC1);
+
+                matPool.thresh = new cv.Mat(HEIGHT, WIDTH, cv.CV_8UC1);
+                matPool.contours = new cv.MatVector();
+                matPool.hierarchy = new cv.Mat();
+
+                logToUI(`initMats success ${WIDTH}x${HEIGHT}`);
+            } catch (e) {
+                logToUI("initMats error: " + e, true);
+                console.error(e);
             }
-
-            matPool.src = new cv.Mat(HEIGHT, WIDTH, cv.CV_8UC4);
-            matPool.gray = new cv.Mat(HEIGHT, WIDTH, cv.CV_8UC1);
-
-            // [Optim] Init downscaled mats
-            let sW = Math.floor(WIDTH * params.detectionScale);
-            let sH = Math.floor(HEIGHT * params.detectionScale);
-            matPool.smallGray = new cv.Mat(sH, sW, cv.CV_8UC1);
-            matPool.smallThresh = new cv.Mat(sH, sW, cv.CV_8UC1);
-
-            matPool.thresh = new cv.Mat(HEIGHT, WIDTH, cv.CV_8UC1); // Keep for legacy or fallback if needed
-            matPool.contours = new cv.MatVector();
-            matPool.hierarchy = new cv.Mat();
         }
 
         function getAverageColor(x, y, radius, imgData, width, height) {
@@ -508,6 +584,10 @@
         function startCamera() {
             isStaticMode = false;
             stopCamera();
+
+            // Show perf panel in camera mode
+            let pp = document.getElementById('perfPanel');
+            if (pp) pp.style.display = 'block';
 
             let constraints = {
                 audio: false,
@@ -675,6 +755,21 @@
             // 0. 更新图集 FBO 尺寸 (如果分辨率变了)
             initAtlasFBO(WIDTH, HEIGHT);
 
+            // [Safety] Check if WebGL is initialized
+            if (!programVideo || !textureVideo) {
+                // Not ready yet
+                return;
+            }
+
+            // [Safety] Check if OpenCV/Mats are initialized
+            if (!matPool.src || !matPool.gray) {
+                if (typeof cv !== 'undefined') {
+                    initMats();
+                }
+                // If still not ready, we can process, but skip CV parts? 
+                // Actually if matPool is empty, we must skip CV parts to avoid crash.
+            }
+
             // ===============================================
             // 1. 绘制底图 (WebGL) - 可视化用
             // ===============================================
@@ -693,9 +788,21 @@
 
             gl.activeTexture(gl.TEXTURE0);
             gl.bindTexture(gl.TEXTURE_2D, textureVideo);
+            gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1); // Ensure alignment
 
             if (isStaticMode) {
-                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, uploadedImage);
+                if (textureNeedsUpdate) {
+                    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, uploadedImage);
+                    let err = gl.getError();
+                    if (err !== gl.NO_ERROR) {
+                        logToUI("GL Error uploading texture: " + err, true);
+                        console.error("GL Error uploading texture: " + err);
+                        if (window.etsProxy) window.etsProxy.postMessage(JSON.stringify({ type: 'error', msg: 'GL Texture Error: ' + err }));
+                    } else {
+                        logToUI("Texture uploaded successfully");
+                    }
+                    textureNeedsUpdate = false;
+                }
             } else {
                 if (video.readyState >= 2) {
                     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
@@ -793,6 +900,14 @@
             // ===============================================
             // 5. OpenCV 核心处理 (检测星芒候选点)
             // ===============================================
+
+            // [Safety] If mats are not ready, skip star detection
+            if (!matPool.gray || !matPool.src) {
+                // Just quit here, we already drew the background
+                perfStats.total += (performance.now() - tTotal);
+                perfStats.sampleCount++;
+                return;
+            }
 
             let detectionMat = p.gray; // 注意：此时图像是倒立的！
             let scale = params.detectionScale;
