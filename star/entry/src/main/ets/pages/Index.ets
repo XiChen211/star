@@ -103,6 +103,10 @@ struct Index {
   // 4. 色彩 (Color)
   @State starSaturation: number = 1.0; // 色彩饱和度增强 (1.0 = 原色)
 
+  // 5. 相机 (Camera)
+  @State cameraZoom: number = 1.0;
+  @State cameraExposure: number = 0.0;
+
   // 旧参数兼容
   @State maxSourceSize: number = 1000; // 兼容旧逻辑，对应 maxArea
   @State maxRatio: number = 3.5; // 兼容旧逻辑
@@ -119,7 +123,8 @@ struct Index {
 
   // 当前选中的参数类别
   @State currentCategory: string = '基础';
-  private categories: string[] = ['智能', '基础', '星芒', '色彩', '过滤', '平滑', '高级'];
+
+  private categories: string[] = ['智能', '基础', '星芒', '色彩', '过滤', '相机', '高级'];
 
   private controller: webview.WebviewController = new webview.WebviewController();
   private isSaving: boolean = false;
@@ -412,6 +417,17 @@ struct Index {
 
               } else if (this.currentCategory === '色彩') {
                  ControlSlider({ label: '色彩饱和度', value: $starSaturation, min: 0.0, max: 3.0, step: 0.1, color: '#F472B6', onValueChange: (v) => this.updateWebParam('starSaturation', v) })
+              } else if (this.currentCategory === '相机') {
+                  if (this.isStaticMode) {
+                     Text('相机控制在这一模式不可用').fontColor(Color.White).opacity(0.5).margin({top: 20})
+                  } else {
+                     ControlSlider({ label: '变焦 (Zoom)', value: $cameraZoom, min: 1.0, max: 5.0, step: 0.1, color: '#3B82F6', onValueChange: (v) => {
+                         if (this.isEngineReady) this.controller.runJavaScript(`setZoom(${v})`);
+                     }})
+                     ControlSlider({ label: '曝光补偿 (EV)', value: $cameraExposure, min: -2.0, max: 2.0, step: 0.5, color: '#3B82F6', onValueChange: (v) => {
+                         if (this.isEngineReady) this.controller.runJavaScript(`setExposure(${v})`);
+                     }})
+                  }
               } else if (this.currentCategory === '智能') {
                  Text('智能模式正在开发中...').fontColor(Color.White).opacity(0.5).margin({top: 20})
               } else {

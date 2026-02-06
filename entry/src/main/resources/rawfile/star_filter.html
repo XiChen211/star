@@ -373,6 +373,26 @@
         }
     };
 
+    window.setZoom = function (value) {
+        if (!stream) return;
+        let track = stream.getVideoTracks()[0];
+        let caps = track.getCapabilities();
+        if (caps.zoom) {
+            track.applyConstraints({ advanced: [{ zoom: value }] })
+                .catch(e => console.error("setZoom failed", e));
+        }
+    };
+
+    window.setExposure = function (value) {
+        if (!stream) return;
+        let track = stream.getVideoTracks()[0];
+        let caps = track.getCapabilities();
+        if (caps.exposureCompensation) {
+            track.applyConstraints({ advanced: [{ exposureCompensation: value }] })
+                .catch(e => console.error("setExposure failed", e));
+        }
+    };
+
     window.loadStaticImage = function (base64Str) {
         let len = base64Str ? base64Str.length : 0;
         logToUI('loadStaticImage called, len: ' + len);
